@@ -56,6 +56,8 @@ typedef struct
 
 	uint64		nr_changes;			/* # of passes in pg_decode_change() */
 									/* FIXME replace with txn->nentries */
+	char 		*limit_to;
+	bool		has_transactions;
 } JsonDecodingData;
 
 /* These must be available to pg_dlsym() */
@@ -87,6 +89,31 @@ _PG_output_plugin_init(OutputPluginCallbacks *cb)
 	cb->shutdown_cb = pg_decode_shutdown;
 }
 
+int
+relation_is_allowed(char *relation, char *constraints)
+{
+	char *c;
+	char *r;
+	char *currentToken;
+	int i;
+
+	if(constraints==NULL) return 1;
+
+	c=strdup(constraints);
+	r=strdup(relation);
+
+	for(i = 0; c[i]; i++){c[i] = tolower(c[i]);}
+	for(i = 0; r[i]; i++){r[i] = tolower(r[i]);}
+
+	currentToken = strtok(c, ",");
+	while(currentToken != NULL) {
+		if(strcmp(r, currentToken)==0) return 1;
+
+		currentToken = strtok(NULL, ","); // get next token
+	}
+	return 0;
+}
+
 /* Initialize this plugin */
 void
 pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is_init)
@@ -107,13 +134,13 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is
 	data->pretty_print = false;
 	data->write_in_chunks = true;
 	data->include_lsn = false;
+	data->has_transactions = false;
 
 	data->nr_changes = 0;
 
 	ctx->output_plugin_private = data;
 
 	opt->output_type = OUTPUT_PLUGIN_TEXTUAL_OUTPUT;
-
 	foreach(option, ctx->output_plugin_options)
 	{
 		DefElem *elem = lfirst(option);
@@ -212,12 +239,28 @@ pg_decode_startup(LogicalDecodingContext *ctx, OutputPluginOptions *opt, bool is
 						 errmsg("could not parse value \"%s\" for parameter \"%s\"",
 							 strVal(elem->arg), elem->defname)));
 		}
+		else if (strcmp(elem->defname, "limit-to") == 0)
+		{
+			if (elem->arg == NULL)
+			{
+				elog(LOG, "limit-to argument is null");
+				data->limit_to = NULL;
+			}
+			else
+			{
+				data->limit_to = strVal(elem->arg);
+			}
+		}
 		else
 		{
 			elog(WARNING, "option %s = %s is unknown",
 				 elem->defname, elem->arg ? strVal(elem->arg) : "(null)");
 		}
 	}
+
+	// Write in chunks should be disabled when the decoding is for specific tables only
+	if(data->limit_to != NULL)
+		data->write_in_chunks = false;
 }
 
 /* cleanup this plugin's resources */
@@ -290,31 +333,36 @@ pg_decode_commit_txn(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 {
 	JsonDecodingData *data = ctx->output_plugin_private;
 
-	if (txn->has_catalog_changes)
-		elog(DEBUG1, "txn has catalog changes: yes");
-	else
-		elog(DEBUG1, "txn has catalog changes: no");
-	elog(DEBUG1, "my change counter: %lu ; # of changes: %lu ; # of changes in memory: %lu", data->nr_changes, txn->nentries, txn->nentries_mem);
-	elog(DEBUG1, "# of subxacts: %d", txn->nsubtxns);
+	if(data->has_transactions){
+		if (txn->has_catalog_changes)
+			elog(DEBUG1, "txn has catalog changes: yes");
+		else
+			elog(DEBUG1, "txn has catalog changes: no");
+		elog(DEBUG1, "my change counter: %lu ; # of changes: %lu ; # of changes in memory: %lu", data->nr_changes, txn->nentries, txn->nentries_mem);
+		elog(DEBUG1, "# of subxacts: %d", txn->nsubtxns);
 
-	/* Transaction ends */
-	if (data->write_in_chunks)
-		OutputPluginPrepareWrite(ctx, true);
+		/* Transaction ends */
+		if (data->write_in_chunks)
+			OutputPluginPrepareWrite(ctx, true);
 
-	if (data->pretty_print)
-	{
-		/* if we don't write in chunks, we need a newline here */
-		if (!data->write_in_chunks)
-			appendStringInfoChar(ctx->out, '\n');
+		if (data->pretty_print)
+		{
+			/* if we don't write in chunks, we need a newline here */
+			if (!data->write_in_chunks)
+				appendStringInfoChar(ctx->out, '\n');
 
-		appendStringInfoString(ctx->out, "\t]\n}");
+			appendStringInfoString(ctx->out, "\t]\n}");
+		}
+		else
+		{
+			appendStringInfoString(ctx->out, "]}");
+		}
+
+		OutputPluginWrite(ctx, true);
 	}
-	else
-	{
-		appendStringInfoString(ctx->out, "]}");
-	}
 
-	OutputPluginWrite(ctx, true);
+	// Set transactions flag back to false
+	data->has_transactions = false;
 }
 
 /*
@@ -656,203 +704,208 @@ pg_decode_change(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 	class_form = RelationGetForm(relation);
 	tupdesc = RelationGetDescr(relation);
 
-	/* Avoid leaking memory by using and resetting our own context */
-	old = MemoryContextSwitchTo(data->context);
-
-	if (data->write_in_chunks)
-		OutputPluginPrepareWrite(ctx, true);
-
-	/* Make sure rd_replidindex is set */
-	RelationGetIndexList(relation);
-
-	/* Sanity checks */
-	switch (change->action)
+	if(relation_is_allowed(NameStr(class_form->relname), data->limit_to))
 	{
-		case REORDER_BUFFER_CHANGE_INSERT:
-			if (change->data.tp.newtuple == NULL)
-			{
-				elog(WARNING, "no tuple data for INSERT in table \"%s\"", NameStr(class_form->relname));
-				return;
-			}
-			break;
-		case REORDER_BUFFER_CHANGE_UPDATE:
-			/*
-			 * Bail out iif:
-			 * (i) doesn't have a pk and replica identity is not full;
-			 * (ii) replica identity is nothing.
-			 */
-			if (!OidIsValid(relation->rd_replidindex) && relation->rd_rel->relreplident != REPLICA_IDENTITY_FULL)
-			{
-				/* FIXME this sentence is imprecise */
-				elog(WARNING, "table \"%s\" without primary key or replica identity is nothing", NameStr(class_form->relname));
-				return;
-			}
+		data->has_transactions = true;
 
-			if (change->data.tp.newtuple == NULL)
-			{
-				elog(WARNING, "no tuple data for UPDATE in table \"%s\"", NameStr(class_form->relname));
-				return;
-			}
-			break;
-		case REORDER_BUFFER_CHANGE_DELETE:
-			/*
-			 * Bail out iif:
-			 * (i) doesn't have a pk and replica identity is not full;
-			 * (ii) replica identity is nothing.
-			 */
-			if (!OidIsValid(relation->rd_replidindex) && relation->rd_rel->relreplident != REPLICA_IDENTITY_FULL)
-			{
-				/* FIXME this sentence is imprecise */
-				elog(WARNING, "table \"%s\" without primary key or replica identity is nothing", NameStr(class_form->relname));
-				return;
-			}
+		/* Avoid leaking memory by using and resetting our own context */
+		old = MemoryContextSwitchTo(data->context);
 
-			if (change->data.tp.oldtuple == NULL)
-			{
-				elog(WARNING, "no tuple data for DELETE in table \"%s\"", NameStr(class_form->relname));
-				return;
-			}
-			break;
-		default:
-			Assert(false);
-	}
+		if (data->write_in_chunks)
+			OutputPluginPrepareWrite(ctx, true);
 
-	/* Change counter */
-	data->nr_changes++;
+		/* Make sure rd_replidindex is set */
+		RelationGetIndexList(relation);
 
-	/* Change starts */
-	if (data->pretty_print)
-	{
-		/* if we don't write in chunks, we need a newline here */
-		if (!data->write_in_chunks)
-			appendStringInfoChar(ctx->out, '\n');
+		/* Sanity checks */
+		switch (change->action)
+		{
+			case REORDER_BUFFER_CHANGE_INSERT:
+				if (change->data.tp.newtuple == NULL)
+				{
+					elog(WARNING, "no tuple data for INSERT in table \"%s\"", NameStr(class_form->relname));
+					return;
+				}
+				break;
+			case REORDER_BUFFER_CHANGE_UPDATE:
+				/*
+				 * Bail out iif:
+				 * (i) doesn't have a pk and replica identity is not full;
+				 * (ii) replica identity is nothing.
+				 */
+				if (!OidIsValid(relation->rd_replidindex) && relation->rd_rel->relreplident != REPLICA_IDENTITY_FULL)
+				{
+					/* FIXME this sentence is imprecise */
+					elog(WARNING, "table \"%s\" without primary key or replica identity is nothing", NameStr(class_form->relname));
+					return;
+				}
 
-		appendStringInfoString(ctx->out, "\t\t");
+				if (change->data.tp.newtuple == NULL)
+				{
+					elog(WARNING, "no tuple data for UPDATE in table \"%s\"", NameStr(class_form->relname));
+					return;
+				}
+				break;
+			case REORDER_BUFFER_CHANGE_DELETE:
+				/*
+				 * Bail out iif:
+				 * (i) doesn't have a pk and replica identity is not full;
+				 * (ii) replica identity is nothing.
+				 */
+				if (!OidIsValid(relation->rd_replidindex) && relation->rd_rel->relreplident != REPLICA_IDENTITY_FULL)
+				{
+					/* FIXME this sentence is imprecise */
+					elog(WARNING, "table \"%s\" without primary key or replica identity is nothing", NameStr(class_form->relname));
+					return;
+				}
 
-		if (data->nr_changes > 1)
-			appendStringInfoChar(ctx->out, ',');
+				if (change->data.tp.oldtuple == NULL)
+				{
+					elog(WARNING, "no tuple data for DELETE in table \"%s\"", NameStr(class_form->relname));
+					return;
+				}
+				break;
+			default:
+				Assert(false);
+		}
 
-		appendStringInfoString(ctx->out, "{\n");
-	}
-	else
-	{
-		if (data->nr_changes > 1)
-			appendStringInfoString(ctx->out, ",{");
+		/* Change counter */
+		data->nr_changes++;
+
+		/* Change starts */
+		if (data->pretty_print)
+		{
+			/* if we don't write in chunks, we need a newline here */
+			if (!data->write_in_chunks)
+				appendStringInfoChar(ctx->out, '\n');
+
+			appendStringInfoString(ctx->out, "\t\t");
+
+			if (data->nr_changes > 1)
+				appendStringInfoChar(ctx->out, ',');
+
+			appendStringInfoString(ctx->out, "{\n");
+		}
 		else
-			appendStringInfoChar(ctx->out, '{');
-	}
-
-	/* Print change kind */
-	switch (change->action)
-	{
-		case REORDER_BUFFER_CHANGE_INSERT:
-			if (data->pretty_print)
-				appendStringInfoString(ctx->out, "\t\t\t\"kind\": \"insert\",\n");
+		{
+			if (data->nr_changes > 1)
+				appendStringInfoString(ctx->out, ",{");
 			else
-				appendStringInfoString(ctx->out, "\"kind\":\"insert\",");
-			break;
-		case REORDER_BUFFER_CHANGE_UPDATE:
-			if(data->pretty_print)
-				appendStringInfoString(ctx->out, "\t\t\t\"kind\": \"update\",\n");
-			else
-				appendStringInfoString(ctx->out, "\"kind\":\"update\",");
-			break;
-		case REORDER_BUFFER_CHANGE_DELETE:
-			if (data->pretty_print)
-				appendStringInfoString(ctx->out, "\t\t\t\"kind\": \"delete\",\n");
-			else
-				appendStringInfoString(ctx->out, "\"kind\":\"delete\",");
-			break;
-		default:
-			Assert(false);
-	}
+				appendStringInfoChar(ctx->out, '{');
+		}
 
-	/* Print table name (possibly) qualified */
-	if (data->pretty_print)
-	{
-		if (data->include_schemas)
-			appendStringInfo(ctx->out, "\t\t\t\"schema\": \"%s\",\n", get_namespace_name(class_form->relnamespace));
-		appendStringInfo(ctx->out, "\t\t\t\"table\": \"%s\",\n", NameStr(class_form->relname));
-	}
-	else
-	{
-		if (data->include_schemas)
-			appendStringInfo(ctx->out, "\"schema\":\"%s\",", get_namespace_name(class_form->relnamespace));
-		appendStringInfo(ctx->out, "\"table\":\"%s\",", NameStr(class_form->relname));
-	}
+		/* Print change kind */
+		switch (change->action)
+		{
+			case REORDER_BUFFER_CHANGE_INSERT:
+				if (data->pretty_print)
+					appendStringInfoString(ctx->out, "\t\t\t\"kind\": \"insert\",\n");
+				else
+					appendStringInfoString(ctx->out, "\"kind\":\"insert\",");
+				break;
+			case REORDER_BUFFER_CHANGE_UPDATE:
+				if(data->pretty_print)
+					appendStringInfoString(ctx->out, "\t\t\t\"kind\": \"update\",\n");
+				else
+					appendStringInfoString(ctx->out, "\"kind\":\"update\",");
+				break;
+			case REORDER_BUFFER_CHANGE_DELETE:
+				if (data->pretty_print)
+					appendStringInfoString(ctx->out, "\t\t\t\"kind\": \"delete\",\n");
+				else
+					appendStringInfoString(ctx->out, "\"kind\":\"delete\",");
+				break;
+			default:
+				Assert(false);
+		}
 
-	switch (change->action)
-	{
-		case REORDER_BUFFER_CHANGE_INSERT:
-			/* Print the new tuple */
-			columns_to_stringinfo(ctx, tupdesc, &change->data.tp.newtuple->tuple, false);
-			break;
-		case REORDER_BUFFER_CHANGE_UPDATE:
-			/* Print the new tuple */
-			columns_to_stringinfo(ctx, tupdesc, &change->data.tp.newtuple->tuple, true);
+		/* Print table name (possibly) qualified */
+		if (data->pretty_print)
+		{
+			if (data->include_schemas)
+				appendStringInfo(ctx->out, "\t\t\t\"schema\": \"%s\",\n", get_namespace_name(class_form->relnamespace));
+			appendStringInfo(ctx->out, "\t\t\t\"table\": \"%s\",\n", NameStr(class_form->relname));
+		}
+		else
+		{
+			if (data->include_schemas)
+				appendStringInfo(ctx->out, "\"schema\":\"%s\",", get_namespace_name(class_form->relnamespace));
+			appendStringInfo(ctx->out, "\"table\":\"%s\",", NameStr(class_form->relname));
+		}
 
-			/*
-			 * The old tuple is available when:
-			 * (i) pk changes;
-			 * (ii) replica identity is full;
-			 * (iii) replica identity is index and indexed column changes.
-			 *
-			 * FIXME if old tuple is not available we must get only the indexed
-			 * columns (the whole tuple is printed).
-			 */
-			if (change->data.tp.oldtuple == NULL)
-			{
-				elog(DEBUG1, "old tuple is null");
+		switch (change->action)
+		{
+			case REORDER_BUFFER_CHANGE_INSERT:
+				/* Print the new tuple */
+				columns_to_stringinfo(ctx, tupdesc, &change->data.tp.newtuple->tuple, false);
+				break;
+			case REORDER_BUFFER_CHANGE_UPDATE:
+				/* Print the new tuple */
+				columns_to_stringinfo(ctx, tupdesc, &change->data.tp.newtuple->tuple, true);
 
+				/*
+				 * The old tuple is available when:
+				 * (i) pk changes;
+				 * (ii) replica identity is full;
+				 * (iii) replica identity is index and indexed column changes.
+				 *
+				 * FIXME if old tuple is not available we must get only the indexed
+				 * columns (the whole tuple is printed).
+				 */
+				if (change->data.tp.oldtuple == NULL)
+				{
+					elog(DEBUG1, "old tuple is null");
+
+					indexrel = RelationIdGetRelation(relation->rd_replidindex);
+					if (indexrel != NULL)
+					{
+						indexdesc = RelationGetDescr(indexrel);
+						identity_to_stringinfo(ctx, tupdesc, &change->data.tp.newtuple->tuple, indexdesc);
+						RelationClose(indexrel);
+					}
+					else
+					{
+						identity_to_stringinfo(ctx, tupdesc, &change->data.tp.newtuple->tuple, NULL);
+					}
+				}
+				else
+				{
+					elog(DEBUG1, "old tuple is not null");
+					identity_to_stringinfo(ctx, tupdesc, &change->data.tp.oldtuple->tuple, NULL);
+				}
+				break;
+			case REORDER_BUFFER_CHANGE_DELETE:
+				/* Print the replica identity */
 				indexrel = RelationIdGetRelation(relation->rd_replidindex);
 				if (indexrel != NULL)
 				{
 					indexdesc = RelationGetDescr(indexrel);
-					identity_to_stringinfo(ctx, tupdesc, &change->data.tp.newtuple->tuple, indexdesc);
+					identity_to_stringinfo(ctx, tupdesc, &change->data.tp.oldtuple->tuple, indexdesc);
 					RelationClose(indexrel);
 				}
 				else
 				{
-					identity_to_stringinfo(ctx, tupdesc, &change->data.tp.newtuple->tuple, NULL);
+					identity_to_stringinfo(ctx, tupdesc, &change->data.tp.oldtuple->tuple, NULL);
 				}
-			}
-			else
-			{
-				elog(DEBUG1, "old tuple is not null");
-				identity_to_stringinfo(ctx, tupdesc, &change->data.tp.oldtuple->tuple, NULL);
-			}
-			break;
-		case REORDER_BUFFER_CHANGE_DELETE:
-			/* Print the replica identity */
-			indexrel = RelationIdGetRelation(relation->rd_replidindex);
-			if (indexrel != NULL)
-			{
-				indexdesc = RelationGetDescr(indexrel);
-				identity_to_stringinfo(ctx, tupdesc, &change->data.tp.oldtuple->tuple, indexdesc);
-				RelationClose(indexrel);
-			}
-			else
-			{
-				identity_to_stringinfo(ctx, tupdesc, &change->data.tp.oldtuple->tuple, NULL);
-			}
 
-			if (change->data.tp.oldtuple == NULL)
-				elog(DEBUG1, "old tuple is null");
-			else
-				elog(DEBUG1, "old tuple is not null");
-			break;
-		default:
-			Assert(false);
+				if (change->data.tp.oldtuple == NULL)
+					elog(DEBUG1, "old tuple is null");
+				else
+					elog(DEBUG1, "old tuple is not null");
+				break;
+			default:
+				Assert(false);
+		}
+
+		if (data->pretty_print)
+			appendStringInfoString(ctx->out, "\t\t}");
+		else
+			appendStringInfoChar(ctx->out, '}');
+
+		MemoryContextSwitchTo(old);
+		MemoryContextReset(data->context);
+
+		if (data->write_in_chunks)
+			OutputPluginWrite(ctx, true);
 	}
-
-	if (data->pretty_print)
-		appendStringInfoString(ctx->out, "\t\t}");
-	else
-		appendStringInfoChar(ctx->out, '}');
-
-	MemoryContextSwitchTo(old);
-	MemoryContextReset(data->context);
-
-	if (data->write_in_chunks)
-		OutputPluginWrite(ctx, true);
 }
